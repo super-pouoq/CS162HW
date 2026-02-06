@@ -32,19 +32,56 @@
 #include "word_count.h"
 #include "word_helpers.h"
 
+#define MAX_THREADS 128
 /*
  * main - handle command line, spawning one thread per file.
  */
+struct thread_arg {
+  word_count_list_t* wclist;
+  char* filename;
+};
+
+
+
+void* thread_count_words(void* arg) {
+  struct thread_arg* targ = (struct thread_arg*)arg;
+  FILE* infile = fopen(targ->filename, "r");
+  if (infile == NULL) {
+    fprintf(stderr, "Could not open file %s\n", targ->filename);
+    pthread_exit(NULL);
+  }
+  count_words(targ->wclist, infile);
+  fclose(infile);
+  free(targ);
+  pthread_exit(NULL);
+}
+word_count_list_t word_counts;
 int main(int argc, char* argv[]) {
   /* Create the empty data structure. */
-  word_count_list_t word_counts;
+  
   init_words(&word_counts);
+  pthread_t threads[MAX_THREADS];
+  int num_threads = 1;
 
   if (argc <= 1) {
     /* Process stdin in a single thread. */
     count_words(&word_counts, stdin);
   } else {
-    /* TODO */
+    num_threads = argc - 1;
+    if (num_threads > MAX_THREADS) {
+      num_threads = MAX_THREADS;
+    }
+    for(int i = 0; i < num_threads; i++) {
+      /* Create a thread to process each file. */
+      char* filename = argv[i + 1];
+      struct thread_arg* arg = malloc(sizeof(struct thread_arg));
+      arg->wclist = &word_counts;
+      arg->filename = filename;
+      pthread_create(&threads[i], NULL, thread_count_words, (void*)arg);
+    }
+    for (int i = 0; i < num_threads; i++) {
+      pthread_join(threads[i], NULL);
+    }
   }
 
   /* Output final result of all threads' work. */

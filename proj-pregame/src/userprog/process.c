@@ -101,7 +101,7 @@ static void start_process(void* file_name_) {
     if_.eflags = FLAG_IF | FLAG_MBS;
     success = load(file_name, &if_.eip, &if_.esp);
   }
-
+  //todo : prepare for argc and argv
   /* Handle failure with succesful PCB malloc. Must free the PCB */
   if (!success && pcb_success) {
     // Avoid race where PCB is freed before t->pcb is set to NULL
@@ -473,7 +473,7 @@ static bool setup_stack(void** esp) {
   if (kpage != NULL) {
     success = install_page(((uint8_t*)PHYS_BASE) - PGSIZE, kpage, true);
     if (success)
-      *esp = PHYS_BASE;
+      *esp = PHYS_BASE-20;
     else
       palloc_free_page(kpage);
   }

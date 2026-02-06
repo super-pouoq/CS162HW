@@ -30,7 +30,6 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
-
 /*
  * Representation of a word count object and word count list object.
  * PINTOS_LIST and/or PTHREADS are #define'd prior to #include to select the
