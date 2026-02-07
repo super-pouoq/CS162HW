@@ -96,10 +96,22 @@ struct thread {
 #ifdef USERPROG
   /* Owned by process.c. */
   struct process* pcb; /* Process control block if this thread is a userprog */
+  struct list children;        /* 当前进程的所有子进程列表 */
+  struct thread* parent;       /* 指向父进程的指针 */
+  struct child_info* info;     /* 指向描述自己状态的那个“中间人”结构体 */
 #endif
 
   /* Owned by thread.c. */
   unsigned magic; /* Detects stack overflow. */
+};
+
+struct child_info {
+    tid_t tid;                  /* 子进程的 ID */
+    int exit_status;            /* 子进程的退出状态 */
+    bool is_exit;               /* 子进程是否已经断气了 */
+    bool is_waited;             /* 父进程是否已经 wait 过它了 */
+    struct semaphore wait_sema; /* 专属传呼机：用于 wait 的信号量 */
+    struct list_elem elem;      /* 用于挂在父进程的 children 列表里 */
 };
 
 /* Types of scheduler that the user can request the kernel

@@ -64,21 +64,25 @@ void palloc_init(size_t user_page_limit) {
    FLAGS, in which case the kernel panics. */
 void* palloc_get_multiple(enum palloc_flags flags, size_t page_cnt) {
   struct pool* pool = flags & PAL_USER ? &user_pool : &kernel_pool;
+  //根据flags选择内存池
   void* pages;
   size_t page_idx;
 
   if (page_cnt == 0)
     return NULL;
 
+  //在位图中查找并标记连续的空闲页
   lock_acquire(&pool->lock);
   page_idx = bitmap_scan_and_flip(pool->used_map, 0, page_cnt, false);
   lock_release(&pool->lock);
 
+  //如果找到了，就计算出对应的内存地址
   if (page_idx != BITMAP_ERROR)
     pages = pool->base + PGSIZE * page_idx;
   else
     pages = NULL;
 
+  //如果成功分配到了页，根据flags决定是否将其清零
   if (pages != NULL) {
     if (flags & PAL_ZERO)
       memset(pages, 0, PGSIZE * page_cnt);

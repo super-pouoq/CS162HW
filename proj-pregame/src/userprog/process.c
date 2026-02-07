@@ -20,12 +20,73 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
+#define MAX_ARG 32
+
 static struct semaphore temporary;
 static thread_func start_process NO_RETURN;
 static thread_func start_pthread NO_RETURN;
 static bool load(const char* file_name, void (**eip)(void), void** esp);
 bool setup_thread(void (**eip)(void), void** esp);
+void load_args(const char* file_name, void** esp);
+struct start_process_args {
+    char *file_name;              // 本来要传的文件名
+    struct child_info *info;      // 你想传的“中间人”结构体
+    struct semaphore *load_sema;  // (可选) 这是一个进阶伏笔，为了实现“父进程等待子进程load成功”
+};
 
+/*load args*/
+void load_args(const char* file_name, void** esp) {
+  char* tokens[MAX_ARG];
+  uint32_t args_addr[64];
+  int argc = 0;
+  char* save_ptr;
+  char* token;
+  token = strtok_r((char*)file_name, " ", &save_ptr);
+
+  while (token != NULL && argc < MAX_ARG) {
+    tokens[argc] = token;
+    argc++;
+    token = strtok_r(NULL, " ", &save_ptr);
+  }
+
+  for(int i = argc - 1; i >= 0; i--) {
+    int len = strlen(tokens[i]) + 1;
+    *esp -= len;
+    memcpy(*esp, tokens[i], len);
+    args_addr[i] = (uint32_t)(*esp);
+  }
+  //word align
+  int total_extra_size = (argc) * 4 + 4 + 4 + 4;
+  // 1. 计算出所有参数占用的空间：(argc 个参数指针 + argv 指针 + argc + fake return address + \0的空间)
+
+  /* 3. 实现 16 字节对齐 */
+  // 预演一下压完所有东西后的位置，然后强行对齐
+  uint32_t final_esp = (uint32_t)(*esp) - total_extra_size;
+  uint32_t aligned_esp = final_esp & 0xfffffff0; 
+  //aligned_esp <= final_esp 恒成立
+
+  // 算出为了对齐需要额外补多少 0
+  uint32_t padding = final_esp - aligned_esp; 
+  if (padding > 0) {
+      *esp -= padding;
+      memset(*esp, 0, padding);
+  }
+  for(int i = argc; i >= 0; i--) {
+    *esp -= 4;
+    if(i == argc) {
+      *(uint32_t*)(*esp) = 0;
+    } else {
+      *(uint32_t*)(*esp) = args_addr[i];
+    }
+  }
+  uint32_t argv = (uint32_t)(*esp);
+  *esp -= 4;
+  *(uint32_t*)(*esp) = argv;
+  *esp -= 4;
+  *(uint32_t*)(*esp) = argc;
+  *esp -= 4;
+  *(uint32_t*)(*esp) = 0; //fake return address
+}
 /* Initializes user programs in the system by ensuring the main
    thread has a minimal PCB so that it can execute and wait for
    the first user process. Any additions to the PCB should be also
@@ -53,8 +114,16 @@ void userprog_init(void) {
 pid_t process_execute(const char* file_name) {
   char* fn_copy;
   tid_t tid;
-
-  sema_init(&temporary, 0);
+  struct child_info* info = malloc(sizeof(struct child_info));
+  if (info == NULL)
+    return TID_ERROR;
+  info->tid = TID_ERROR;
+  info->is_exit = false;
+  info->is_waited = false;
+  info->exit_status = 0;
+  sema_init(&info->wait_sema, 0);
+  
+  
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page(0);
@@ -62,29 +131,57 @@ pid_t process_execute(const char* file_name) {
     return TID_ERROR;
   strlcpy(fn_copy, file_name, PGSIZE);
 
+  char thread_name[16]; // 线程名最长就 16 字节，够用了
+  strlcpy(thread_name, file_name, sizeof thread_name);
+  char *cp = thread_name;
+  while(*cp != '\0' && *cp != ' '){
+    cp++;
+  }
+  char delimiter = *cp;
+  *cp = '\0';
+
+  list_push_back(&thread_current()->children, &info->elem);
+  struct start_process_args *args = malloc(sizeof(struct start_process_args));
+    args->file_name = fn_copy;
+    args->info = info;
+  
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create(file_name, PRI_DEFAULT, start_process, fn_copy);
-  if (tid == TID_ERROR)
+  tid = thread_create(thread_name, PRI_DEFAULT, start_process, args);
+  *cp = delimiter;
+  if (tid == TID_ERROR){
+    list_remove(&info->elem);
     palloc_free_page(fn_copy);
+    free(args);
+    free(info);
+  }
+  else{
+    info->tid = tid;
+  }
   return tid;
 }
 
 /* A thread function that loads a user process and starts it
    running. */
-static void start_process(void* file_name_) {
-  char* file_name = (char*)file_name_;
+static void start_process(void* args_) {
+  struct start_process_args *args = (struct start_process_args *)args_;
+  char* file_name = args->file_name;
+  struct child_info *info = args->info;
   struct thread* t = thread_current();
   struct intr_frame if_;
   bool success, pcb_success;
 
+  t->info = info;
+  free(args); // 释放传参结构体内容，避免内存泄漏
   /* Allocate process control block */
   struct process* new_pcb = malloc(sizeof(struct process));
   success = pcb_success = new_pcb != NULL;
-
-  /* Initialize process control block */
+  //检查是否分配成功
+  //将 PCB 连接到线程上
   if (success) {
     // Ensure that timer_interrupt() -> schedule() -> process_activate()
     // does not try to activate our uninitialized pagedir
+    //保证在我们初始化 pagedir 之前不会被使用
+    // 因为 timer_interrupt 可能随时打断我们
     new_pcb->pagedir = NULL;
     t->pcb = new_pcb;
 
@@ -93,16 +190,33 @@ static void start_process(void* file_name_) {
     strlcpy(t->pcb->process_name, t->name, sizeof t->name);
   }
 
-  /* Initialize interrupt frame and load executable. */
+  //把文件名拆开，只留程序名部分
+  char *cp = file_name;
+  
+  // 1. 手动找到第一个空格
+  while (*cp != '\0' && *cp != ' ') {
+      cp++;
+  }
+  
+  char delimiter = *cp; // 记住原来的字符（可能是空格，也可能是 \0）
+  *cp = '\0';           // 暂时切断
+  //把elf加载到内存中
   if (success) {
     memset(&if_, 0, sizeof if_);
     if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
     if_.cs = SEL_UCSEG;
     if_.eflags = FLAG_IF | FLAG_MBS;
+    //success = load(file_name, &if_.eip, &if_.esp);
     success = load(file_name, &if_.eip, &if_.esp);
   }
+  *cp = delimiter; // 恢复原来的字符
+  // 2. 装载命令行参数到用户栈
+  load_args(file_name, &if_.esp);
+
   //todo : prepare for argc and argv
   /* Handle failure with succesful PCB malloc. Must free the PCB */
+  // 如果加载失败，但 PCB 分配成功了
+  // 要把 PCB 给 free 掉，避免内存泄漏
   if (!success && pcb_success) {
     // Avoid race where PCB is freed before t->pcb is set to NULL
     // If this happens, then an unfortuantely timed timer interrupt
@@ -113,9 +227,13 @@ static void start_process(void* file_name_) {
   }
 
   /* Clean up. Exit on failure or jump to userspace */
+  // 无论成功与否，都要释放文件名页
   palloc_free_page(file_name);
+  // 如果加载失败，就把 exit_status 设为 -1，通知父进程
   if (!success) {
-    sema_up(&temporary);
+    t->info->exit_status = -1;
+    sema_up(&info->wait_sema); // 通知父进程 load 失败了
+    t->info->is_exit = true;
     thread_exit();
   }
 
@@ -125,6 +243,9 @@ static void start_process(void* file_name_) {
      arguments on the stack in the form of a `struct intr_frame',
      we just point the stack pointer (%esp) to our stack frame
      and jump to it. */
+  /*启动用户进程通过模拟从中断返回来实现，由 intr_exit 实现（在 threads/intr-stubs.S 中）。
+    因为 intr_exit 以 struct intr_frame 的形式在堆栈上获取它的所有参数，
+    我们只需将堆栈指针（%esp）指向我们的堆栈帧并跳转到它。*/
   asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&if_) : "memory");
   NOT_REACHED();
 }
@@ -138,9 +259,50 @@ static void start_process(void* file_name_) {
 
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
-int process_wait(pid_t child_pid UNUSED) {
-  sema_down(&temporary);
-  return 0;
+int process_wait(pid_t child_pid) {
+    // 1. 获取当前线程（父进程）
+    struct thread *cur = thread_current();
+    
+    // 2. 遍历 cur->children 链表，寻找 tid == child_pid 的那个 info
+    struct list_elem *e;
+    struct child_info *target_info = NULL;
+    
+    for (e = list_begin(&cur->children); e != list_end(&cur->children); e = list_next(e)) {
+        struct child_info *info = list_entry(e, struct child_info, elem);
+        if (info->tid == child_pid) {
+            target_info = info;
+            break;
+        }
+    }
+
+    // 3. 如果找不到（比如这是一个无效的 pid，或者是别人的孩子），直接返回 -1
+    if (target_info == NULL) {
+        return -1;
+    }
+
+    // 4. 【关键】如果这个孩子已经被 wait 过了，不能再 wait，返回 -1
+    // (Pintos 文档要求：一个进程只能被父进程 wait 一次)
+    if (target_info->is_waited) {
+        return -1;
+    }
+    
+    // 5. 标记为已等待
+    target_info->is_waited = true;
+
+    // 6. 等待子进程结束（P 操作）
+    // 如果子进程还没结束，父进程会在这里阻塞（睡觉）
+    // 如果子进程已经结束（exit_exit = true），信号量已经是 1 了，这里直接减为 0 并继续
+    sema_down(&target_info->wait_sema);
+
+    // 7. 醒来后，获取退出码
+    int status = target_info->exit_status;
+
+    // 8. 收尸（将 info 从链表移除并释放内存）
+    list_remove(&target_info->elem);
+    free(target_info);
+
+    // 9. 返回退出码
+    return status;
 }
 
 /* Free the current process's resources. */
@@ -148,37 +310,67 @@ void process_exit(void) {
   struct thread* cur = thread_current();
   uint32_t* pd;
 
+  /* 1. 打印退出信息 (必做！否则测试全挂)
+     格式必须严格按照 "%s: exit(%d)\n"
+     如果 cur->info 为空（比如内核线程），这里可能会崩，可以加个判断 */
+  int exit_code = 0;
+  if (cur->info != NULL) {
+      exit_code = cur->info->exit_status;
+  }
+
+  /* 2. 通知父进程：我做完了 */
+  if (cur->info != NULL) {
+      // 标记我已经退出了
+      cur->info->is_exit = true;
+      // 唤醒父进程（父进程正在 wait_sema 上睡觉）
+      sema_up(&cur->info->wait_sema);
+  }
+
+  /* 3. 处理孤儿（我的孩子们）
+     如果我死了，我的孩子们还在运行，或者它们死了还没被收尸，
+     我作为父亲，临死前要把这本“花名册”销毁掉，防止内存泄漏。
+     
+     注意：这是一个简单的清理。更严谨的做法涉及“孤儿进程”的处理，
+     但为了跑通测试，至少要把 malloc 的 list 节点释放掉。 */
+  struct list_elem *e = list_begin(&cur->children);
+  while (e != list_end(&cur->children)) {
+      struct list_elem *next = list_next(e);
+      struct child_info *child = list_entry(e, struct child_info, elem);
+      
+      // 这里的逻辑有点复杂：如果子进程还在跑，我能不能 free 它的 info？
+      // 简单做法：把 info 从链表摘除，free 掉。
+      // 但要小心子进程访问悬空指针（这是一个进阶的同步难题）。
+      // 现阶段你可以先尝试释放，或者先只做 list_remove。
+      list_remove(e);
+      free(child); 
+      
+      e = next;
+  }
+
+  /* 下面是原本的内存清理逻辑，保持不变 */
+  
   /* If this thread does not have a PCB, don't worry */
   if (cur->pcb == NULL) {
     thread_exit();
     NOT_REACHED();
   }
 
-  /* Destroy the current process's page directory and switch back
-     to the kernel-only page directory. */
+  /* Destroy the current process's page directory... */
   pd = cur->pcb->pagedir;
   if (pd != NULL) {
-    /* Correct ordering here is crucial.  We must set
-         cur->pcb->pagedir to NULL before switching page directories,
-         so that a timer interrupt can't switch back to the
-         process page directory.  We must activate the base page
-         directory before destroying the process's page
-         directory, or our active page directory will be one
-         that's been freed (and cleared). */
     cur->pcb->pagedir = NULL;
     pagedir_activate(NULL);
     pagedir_destroy(pd);
   }
 
-  /* Free the PCB of this process and kill this thread
-     Avoid race where PCB is freed before t->pcb is set to NULL
-     If this happens, then an unfortuantely timed timer interrupt
-     can try to activate the pagedir, but it is now freed memory */
+  /* Free the PCB of this process */
   struct process* pcb_to_free = cur->pcb;
   cur->pcb = NULL;
   free(pcb_to_free);
 
-  sema_up(&temporary);
+  /* 4. 删掉旧的全局信号量操作 */
+  // sema_up(&temporary); <--- 这行删掉！
+
   thread_exit();
 }
 
@@ -263,6 +455,7 @@ static bool setup_stack(void** esp);
 static bool validate_segment(const struct Elf32_Phdr*, struct file*);
 static bool load_segment(struct file* file, off_t ofs, uint8_t* upage, uint32_t read_bytes,
                          uint32_t zero_bytes, bool writable);
+
 
 /* Loads an ELF executable from FILE_NAME into the current thread.
    Stores the executable's entry point into *EIP
@@ -433,7 +626,7 @@ static bool load_segment(struct file* file, off_t ofs, uint8_t* upage, uint32_t 
   while (read_bytes > 0 || zero_bytes > 0) {
     /* Calculate how to fill this page.
          We will read PAGE_READ_BYTES bytes from FILE
-         and zero the final PAGE_ZERO_BYTES bytes. */
+         and zero the final PAGE_ZRO_BYTES bytes. */
     size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
     size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
@@ -469,11 +662,19 @@ static bool setup_stack(void** esp) {
   uint8_t* kpage;
   bool success = false;
 
+  char* tokens[MAX_ARG];
+  uint32_t args_addr[64];
+  int argc = 0;
+  char* save_ptr;
+  char* token;
+
   kpage = palloc_get_page(PAL_USER | PAL_ZERO);
   if (kpage != NULL) {
     success = install_page(((uint8_t*)PHYS_BASE) - PGSIZE, kpage, true);
     if (success)
-      *esp = PHYS_BASE-20;
+    {
+        *esp = PHYS_BASE;
+      }
     else
       palloc_free_page(kpage);
   }

@@ -430,7 +430,11 @@ static void init_thread(struct thread* t, const char* name, int priority) {
   t->priority = priority;
   t->pcb = NULL;
   t->magic = THREAD_MAGIC;
-
+#ifdef USERPROG
+    list_init(&t->children);  // 初始化子进程链表
+    t->pcb = NULL;            // 初始化 PCB 指针
+    t->info = NULL;           // 初始化 info 指针
+#endif
   old_level = intr_disable();
   list_push_back(&all_list, &t->allelem);
   intr_set_level(old_level);
