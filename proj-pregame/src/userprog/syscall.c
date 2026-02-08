@@ -40,4 +40,7 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
   if(args[0] == SYS_WAIT) {
     f->eax = process_wait((pid_t)args[1]);
   }
+  if(args[0] == SYS_FORK) {
+    f->eax = process_fork(thread_current()->name, f);
+  }
 }

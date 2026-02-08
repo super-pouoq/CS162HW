@@ -12,7 +12,7 @@
 /* PIDs and TIDs are the same type. PID should be
    the TID of the main thread of the process */
 typedef tid_t pid_t;
-
+struct intr_frame;
 /* Thread functions (Project 2: Multithreading) */
 typedef void (*pthread_fun)(void*);
 typedef void (*stub_fun)(pthread_fun, void*);
@@ -36,6 +36,9 @@ int process_wait(pid_t);
 void process_exit(void);
 void process_activate(void);
 
+pid_t process_fork(const char* name, struct intr_frame* iframe);
+static void start_child_process(void*);
+static bool pagedir_duplicate(struct thread *parent, struct thread *child);
 bool is_main_thread(struct thread*, struct process*);
 pid_t get_pid(struct process*);
 

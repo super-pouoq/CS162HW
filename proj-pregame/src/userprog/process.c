@@ -31,7 +31,11 @@ void load_args(const char* file_name, void** esp);
 struct start_process_args {
     char *file_name;              // 本来要传的文件名
     struct child_info *info;      // 你想传的“中间人”结构体
-    struct semaphore *load_sema;  // (可选) 这是一个进阶伏笔，为了实现“父进程等待子进程load成功”
+};
+struct start_child_process_args{
+    struct intr_frame* parent_if;
+    struct child_info* info;
+    struct thread* parent_thread;
 };
 
 /*load args*/
@@ -158,6 +162,122 @@ pid_t process_execute(const char* file_name) {
     info->tid = tid;
   }
   return tid;
+}
+
+pid_t process_fork(const char* name, struct intr_frame* iframe) {
+  struct child_info* info = malloc(sizeof(struct child_info));
+  if (info == NULL)
+    return TID_ERROR;
+  info->tid = TID_ERROR;
+  info->is_exit = false;
+  info->is_waited = false;
+  info->exit_status = 0;
+  sema_init(&info->wait_sema, 0);
+  char thread_name[16];
+  strlcpy(thread_name, name, sizeof thread_name);
+  char *cp = thread_name;
+  while(*cp != '\0' && *cp != ' '){
+    cp++;
+  }
+  char delimiter = *cp;
+  *cp = '\0';
+  list_push_back(&thread_current()->children, &info->elem);
+  struct start_child_process_args *args = malloc(sizeof(struct start_child_process_args));
+    args->parent_if = iframe;
+    args->info = info;
+    args->parent_thread = thread_current();
+  tid_t tid = thread_create(thread_name, PRI_DEFAULT, start_child_process, args);
+  *cp = delimiter;
+  if (tid == TID_ERROR){
+    list_remove(&info->elem);
+    free(args);
+    free(info);
+  }
+  else{
+    info->tid = tid;
+  }
+  return tid;
+}
+
+static void start_child_process(void* args_) {
+    struct start_child_process_args* args = (struct start_child_process_args*)args_;
+    struct thread* curr = thread_current();
+    struct intr_frame if_;
+
+    // 1. 【接收记忆】深拷贝父进程的中断帧到我的本地变量
+    // 因为 args->parent_if 是指针，这行执行完之前，父进程绝对不能动
+    memcpy(&if_, args->parent_if, sizeof(struct intr_frame));
+    
+    // fork 的魔法：子进程返回 0
+    if_.eax = 0; 
+    curr->pcb->pagedir = pagedir_create();
+    process_activate();
+    // 2. 【克隆身体】复制页表、文件描述符等
+    bool success = pagedir_duplicate(args->parent_thread, curr);
+    
+    // 3. 【填写身份证】
+    if (success) {
+        args->info->tid = curr->tid;
+    } else {
+        args->info->tid = TID_ERROR;
+    }
+
+    // 4. 【关键】通知父进程：我拷贝完了，你可以走了
+    // 此时 args->parent_if 这个指针就没有利用价值了，父进程栈销毁也没事了
+    sema_up(&args->info->wait_sema);
+
+    // 5. 资源清理
+    free(args); // args 是父进程 malloc 的，子进程用完了要负责释放
+
+    if (!success) {
+        thread_exit(); // 克隆失败，自杀
+    }
+
+    // 6. 带着父进程的记忆，跳入用户态
+    asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
+    NOT_REACHED();
+}
+
+/* 把父进程的页表复制给子进程 
+   成功返回 true，失败返回 false */
+static bool pagedir_duplicate(struct thread *parent, struct thread *child) {
+    uint32_t *parent_pd = parent->pcb->pagedir;
+    uint32_t *child_pd = child->pcb->pagedir; // 这时应该是空的，或者是刚初始化的
+    void *vaddr;
+
+    // 我们遍历整个用户空间的虚拟地址 (从 0 到 PHYS_BASE)
+    // 每次跳过一页 (PGSIZE = 4KB)
+    for (vaddr = 0; vaddr < PHYS_BASE; vaddr += PGSIZE) {
+        
+        // 1. 问：父进程在这个虚拟地址有数据吗？
+        void *parent_kpage = pagedir_get_page(parent_pd, vaddr);
+
+        // 2. 如果父进程这里有页，我们也要有！
+        if (parent_kpage != NULL) {
+            // A. 给子进程申请一个新的物理页 (Kernel Page)
+            void *child_kpage = palloc_get_page(PAL_USER | PAL_ZERO);
+            if (child_kpage == NULL) {
+                return false; // 内存不足，拷贝失败
+            }
+
+            // B. 【深拷贝】把父进程这一页的内容，原封不动地抄过来
+            // 注意：一定要用 PGSIZE，不要用 strlen，因为里面可能包含 \0
+            memcpy(child_kpage, parent_kpage, PGSIZE);
+
+            // C. 建立映射：让子进程的 vaddr 指向这个新的 child_kpage
+            // 我们还需要知道这页是不是只读的 (writable?)
+            // 这个需要去 pagedir.c 里加个函数或者暂时默认为 true (Pintos Project 2 只有代码段是只读的)
+            // 简单的做法是：假设都是可写的，或者自己去 pagedir.c 实现 lookup_page_writable
+            bool writable = true; 
+            
+            // 将新页挂载到子进程的页表上
+            if (!pagedir_set_page(child_pd, vaddr, child_kpage, writable)) {
+                palloc_free_page(child_kpage);
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 /* A thread function that loads a user process and starts it
@@ -539,6 +659,7 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
         break;
     }
   }
+
 
   /* Set up stack. */
   if (!setup_stack(esp))
