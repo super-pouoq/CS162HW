@@ -329,7 +329,8 @@ static void start_process(void* args_) {
     //success = load(file_name, &if_.eip, &if_.esp);
     success = load(file_name, &if_.eip, &if_.esp);
   }
-  *cp = delimiter; // 恢复原来的字符
+  // 恢复原来的字符
+  *cp = delimiter;
   // 2. 装载命令行参数到用户栈
   load_args(file_name, &if_.esp);
 
@@ -366,6 +367,7 @@ static void start_process(void* args_) {
   /*启动用户进程通过模拟从中断返回来实现，由 intr_exit 实现（在 threads/intr-stubs.S 中）。
     因为 intr_exit 以 struct intr_frame 的形式在堆栈上获取它的所有参数，
     我们只需将堆栈指针（%esp）指向我们的堆栈帧并跳转到它。*/
+  //printf("(%s) begin\n", file_name);
   asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&if_) : "memory");
   NOT_REACHED();
 }
@@ -491,6 +493,11 @@ void process_exit(void) {
   /* 4. 删掉旧的全局信号量操作 */
   // sema_up(&temporary); <--- 这行删掉！
 
+  if(cur->bin_file != NULL){
+    file_allow_write(cur->bin_file);
+    file_close(cur->bin_file);
+    cur->bin_file = NULL;
+  }
   thread_exit();
 }
 
@@ -597,11 +604,13 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
 
   /* Open executable file. */
   file = filesys_open(file_name);
+
   if (file == NULL) {
     printf("load: %s: open failed\n", file_name);
-    goto done;
+    return success;
   }
-
+  t->bin_file=file;
+  file_deny_write(file);
   /* Read and verify executable header. */
   if (file_read(file, &ehdr, sizeof ehdr) != sizeof ehdr ||
       memcmp(ehdr.e_ident, "\177ELF\1\1\1", 7) || ehdr.e_type != 2 || ehdr.e_machine != 3 ||
@@ -672,7 +681,12 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
 
 done:
   /* We arrive here whether the load is successful or not. */
-  file_close(file);
+  if (!success) { 
+      // 只有失败了才关闭文件！
+      // 如果成功了，这个 file 指针已经被保存在 t->bin_file 里了，
+      // 我们需要它一直保持打开状态，直到 process_exit。
+      file_close(file); 
+  }
   return success;
 }
 
