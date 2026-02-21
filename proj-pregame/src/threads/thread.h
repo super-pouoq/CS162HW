@@ -89,16 +89,17 @@ struct thread {
   uint8_t* stack;            /* Saved stack pointer. */
   int priority;              /* Priority. */
   struct list_elem allelem;  /* List element for all threads list. */
-
+  struct file* bin_file;
   /* Shared between thread.c and synch.c. */
   struct list_elem elem; /* List element. */
 
+  struct file* fd_table[128]; /* 文件描述符表 */
+  struct list children;        /* 当前进程的所有子进程列表 */
+  struct child_info* info;     /* 指向描述自己状态的那个“中间人”结构体 */
 #ifdef USERPROG
   /* Owned by process.c. */
   struct process* pcb; /* Process control block if this thread is a userprog */
-  struct list children;        /* 当前进程的所有子进程列表 */
-  struct thread* parent;       /* 指向父进程的指针 */
-  struct child_info* info;     /* 指向描述自己状态的那个“中间人”结构体 */
+
 #endif
 
   /* Owned by thread.c. */
@@ -161,4 +162,5 @@ void thread_set_nice(int);
 int thread_get_recent_cpu(void);
 int thread_get_load_avg(void);
 
+int add_fd_to_table(struct thread* t, struct file* f);
 #endif /* threads/thread.h */

@@ -568,3 +568,13 @@ static tid_t allocate_tid(void) {
 /* Offset of `stack' member within `struct thread'.
    Used by switch.S, which can't figure it out on its own. */
 uint32_t thread_stack_ofs = offsetof(struct thread, stack);
+
+int add_fd_to_table(struct thread* t, struct file* f) {
+    for (int fd = 3; fd < 128; fd++) { // 从 2 开始，0 和 1 通常保留给标准输入输出
+        if (t->fd_table[fd] == NULL) {
+            t->fd_table[fd] = f;
+            return fd;
+        }
+    }
+    return -1; // 文件描述符表已满
+}

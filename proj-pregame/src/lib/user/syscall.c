@@ -78,6 +78,9 @@ void exit(int status) {
 
 pid_t exec(const char* file) { return (pid_t)syscall1(SYS_EXEC, file); }
 
+pid_t fork(void) {
+  return (pid_t)syscall0(SYS_FORK);
+}
 int wait(pid_t pid) { return syscall1(SYS_WAIT, pid); }
 
 bool create(const char* file, unsigned initial_size) {
