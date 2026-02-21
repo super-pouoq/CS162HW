@@ -26,8 +26,8 @@ TEST(16);
 TEST(64);
 TEST(256);
 
-struct semaphore barrier_sema;
-struct semaphore sleep_sema;
+static struct semaphore barrier_sema;
+static struct semaphore sleep_sema;
 
 void test_smfs_starve(size_t competing_threads) {
   ASSERT(active_sched_policy == SCHED_FAIR);

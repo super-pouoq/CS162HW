@@ -32,6 +32,7 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 
+#define MAX_DONATION_DEPTH 8
 /* Initializes semaphore SEMA to VALUE.  A semaphore is a
    nonnegative integer along with two atomic operators for
    manipulating it:
@@ -63,7 +64,8 @@ void sema_down(struct semaphore* sema) {
 
   old_level = intr_disable();
   while (sema->value == 0) {
-    list_push_back(&sema->waiters, &thread_current()->elem);
+    // list_push_back(&sema->waiters, &thread_current()->elem);
+    list_insert_ordered(&sema->waiters, &thread_current()->elem, thread_cmp_priority_elem, NULL); // 优先级高的排在前面
     thread_block();
   }
   sema->value--;
@@ -102,8 +104,10 @@ void sema_up(struct semaphore* sema) {
   ASSERT(sema != NULL);
 
   old_level = intr_disable();
-  if (!list_empty(&sema->waiters))
+  if (!list_empty(&sema->waiters)){
+    list_sort(&sema->waiters, thread_cmp_priority_elem, NULL);
     thread_unblock(list_entry(list_pop_front(&sema->waiters), struct thread, elem));
+  }
   sema->value++;
   intr_set_level(old_level);
 }
@@ -173,11 +177,38 @@ void lock_acquire(struct lock* lock) {
   ASSERT(lock != NULL);
   ASSERT(!intr_context());
   ASSERT(!lock_held_by_current_thread(lock));
-
+  struct thread *curr = thread_current();
+  if(lock->holder != NULL) { // 这个锁已经有主人了
+    curr->wait_lock = lock; // 我正在等这个锁
+    list_push_back(&lock->holder->donations, &curr->donation_elem); // 把我加到这个锁的主人的捐赠列表里
+    donate_priority(curr); // 捐赠优先级
+  }
   sema_down(&lock->semaphore);
   lock->holder = thread_current();
+  curr->wait_lock = NULL;   // 我不再等这个锁了
+  lock->holder = curr;         // 这个锁的主人是我了
 }
 
+void donate_priority(struct thread *t) {
+    int depth = 0;
+    // 顺藤摸瓜：只要我还等着锁，且没超过 8 层
+    while (t->wait_lock != NULL && depth < MAX_DONATION_DEPTH) {
+        struct thread *holder = t->wait_lock->holder;
+        if (holder == NULL) break;
+        
+        // 如果我的优先级比持锁人大，就把我的优先级给他
+        if (holder->priority < t->priority) {
+            holder->priority = t->priority;
+        } else {
+            // 如果持锁人比我还高，说明不用往上传递了，直接退出
+            break; 
+        }
+        
+        // 继续顺藤摸瓜
+        t = holder;
+        depth++;
+    }
+}
 /* Tries to acquires LOCK and returns true if successful or false
    on failure.  The lock must not already be held by the current
    thread.
@@ -204,11 +235,49 @@ bool lock_try_acquire(struct lock* lock) {
 void lock_release(struct lock* lock) {
   ASSERT(lock != NULL);
   ASSERT(lock_held_by_current_thread(lock));
-
+  remove_with_lock(lock); // 先把和这个锁相关的捐赠都撤销了
+  update_priority(); // 更新一下优先级
   lock->holder = NULL;
+
   sema_up(&lock->semaphore);
 }
 
+void remove_with_lock(struct lock *lock) {
+    struct list_elem *e;
+    struct thread *curr = thread_current();
+    
+    // 注意：因为要在遍历的过程中删除元素，所以不能用常规的 for 循环
+    for (e = list_begin(&curr->donations); e != list_end(&curr->donations); ) {
+        // 使用专门的 donation_elem 解析出线程
+        struct thread *t = list_entry(e, struct thread, donation_elem);
+        
+        // 如果这个捐赠者是在等我现在要释放的这把锁
+        if (t->wait_lock == lock) {
+            e = list_remove(e); // 把它踢出列表，并自动获取下一个元素的指针
+        } else {
+            e = list_next(e);   // 否则直接看下一个
+        }
+    }
+}
+
+void update_priority(void) {
+    struct thread *curr = thread_current();
+    
+    // 1. 先把自己打回原形（恢复到基础优先级）
+    curr->priority = curr->base_priority;
+    
+    // 2. 如果还有其他人在给我捐赠（因为我还持有其他的锁）
+    if (!list_empty(&curr->donations)) {
+        // 由于捐赠者的优先级可能会动态变化，最稳妥的做法是遍历一遍找最大值
+        struct list_elem *e;
+        for (e = list_begin(&curr->donations); e != list_end(&curr->donations); e = list_next(e)) {
+            struct thread *t = list_entry(e, struct thread, donation_elem);
+            if (t->priority > curr->priority) {
+                curr->priority = t->priority; // 更新为更高的优先级
+            }
+        }
+    }
+}
 /* Returns true if the current thread holds LOCK, false
    otherwise.  (Note that testing whether some other thread holds
    a lock would be racy.) */
@@ -280,6 +349,7 @@ void rw_lock_release(struct rw_lock* rw_lock, bool reader) {
 struct semaphore_elem {
   struct list_elem elem;      /* List element. */
   struct semaphore semaphore; /* This semaphore. */
+  struct thread *holder; /* 记录是哪个线程在等待这个信号量，方便我们在比较优先级时访问它的 priority 字段 */
 };
 
 /* Initializes condition variable COND.  A condition variable
@@ -311,6 +381,17 @@ void cond_init(struct condition* cond) {
    interrupt handler.  This function may be called with
    interrupts disabled, but interrupts will be turned back on if
    we need to sleep. */
+bool cond_waiter_priority (const struct list_elem *a,
+                             const struct list_elem *b,
+                             void *aux UNUSED) 
+{
+  struct semaphore_elem *sa = list_entry (a, struct semaphore_elem, elem);
+  struct semaphore_elem *sb = list_entry (b, struct semaphore_elem, elem);
+  
+  return sa->holder->priority > sb->holder->priority; // 优先级高的排在前面
+}
+
+// 修正后的 cond_wait
 void cond_wait(struct condition* cond, struct lock* lock) {
   struct semaphore_elem waiter;
 
@@ -320,7 +401,9 @@ void cond_wait(struct condition* cond, struct lock* lock) {
   ASSERT(lock_held_by_current_thread(lock));
 
   sema_init(&waiter.semaphore, 0);
+  waiter.holder = thread_current(); 
   list_push_back(&cond->waiters, &waiter.elem);
+  
   lock_release(lock);
   sema_down(&waiter.semaphore);
   lock_acquire(lock);
@@ -339,8 +422,10 @@ void cond_signal(struct condition* cond, struct lock* lock UNUSED) {
   ASSERT(!intr_context());
   ASSERT(lock_held_by_current_thread(lock));
 
-  if (!list_empty(&cond->waiters))
+  if (!list_empty(&cond->waiters)){
+    list_sort(&cond->waiters, cond_waiter_priority, NULL);
     sema_up(&list_entry(list_pop_front(&cond->waiters), struct semaphore_elem, elem)->semaphore);
+  }
 }
 
 /* Wakes up all threads, if any, waiting on COND (protected by

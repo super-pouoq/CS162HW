@@ -58,5 +58,11 @@ void rw_lock_release(struct rw_lock*, bool reader);
    optimization barrier.  See "Optimization Barriers" in the
    reference guide for more information.*/
 #define barrier() asm volatile("" : : : "memory")
+bool cond_waiter_priority (const struct list_elem *a,
+                             const struct list_elem *b,
+                             void *aux);
 
+void donate_priority(struct thread *t);
+void remove_with_lock(struct lock *lock);
+void update_priority(void);
 #endif /* threads/synch.h */

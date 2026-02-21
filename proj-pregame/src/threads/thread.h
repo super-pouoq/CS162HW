@@ -88,6 +88,7 @@ struct thread {
   char name[16];             /* Name (for debugging purposes). */
   uint8_t* stack;            /* Saved stack pointer. */
   int priority;              /* Priority. */
+  int base_priority;
   struct list_elem allelem;  /* List element for all threads list. */
   struct file* bin_file;
   /* Shared between thread.c and synch.c. */
@@ -96,6 +97,11 @@ struct thread {
   struct file* fd_table[128]; /* 文件描述符表 */
   struct list children;        /* 当前进程的所有子进程列表 */
   struct child_info* info;     /* 指向描述自己状态的那个“中间人”结构体 */
+
+  int64_t wakeup_tick; /* 线程被唤醒的时间（单位：tick） */
+  struct lock* wait_lock; /* 线程正在等待的锁（如果有的话） */
+  struct list donations; /* 进行优先级捐赠时，保存捐赠者的列表 */
+  struct list_elem donation_elem; /* 用于挂在捐赠者的 donations 列表里 */
 #ifdef USERPROG
   /* Owned by process.c. */
   struct process* pcb; /* Process control block if this thread is a userprog */
@@ -143,6 +149,9 @@ tid_t thread_create(const char* name, int priority, thread_func*, void*);
 void thread_block(void);
 void thread_unblock(struct thread*);
 
+void thread_sleep(int64_t wakeup_tick);
+void thread_check_sleep(int64_t current_tick);
+
 struct thread* thread_current(void);
 tid_t thread_tid(void);
 const char* thread_name(void);
@@ -163,4 +172,8 @@ int thread_get_recent_cpu(void);
 int thread_get_load_avg(void);
 
 int add_fd_to_table(struct thread* t, struct file* f);
+
+bool thread_cmp_priority_elem (const struct list_elem *a, const struct list_elem *b, void *aux);
+bool thread_cmp_priority_allelem (const struct list_elem *a, const struct list_elem *b, void *aux);
+void thread_test_preemption(void);
 #endif /* threads/thread.h */

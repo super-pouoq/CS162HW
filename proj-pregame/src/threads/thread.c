@@ -23,7 +23,8 @@
 /* List of processes in THREAD_READY state, that is, processes
    that are ready to run but not actually running. */
 static struct list fifo_ready_list;
-
+static struct list prio_ready_list;
+static struct list sleep_list;
 /* List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
 static struct list all_list;
@@ -36,6 +37,8 @@ static struct thread* initial_thread;
 
 /* Lock used by allocate_tid(). */
 static struct lock tid_lock;
+
+static int64_t min_wakeup_tick = INT64_MAX;
 
 /* Stack frame for kernel_thread(). */
 struct kernel_thread_frame {
@@ -108,6 +111,8 @@ void thread_init(void) {
 
   lock_init(&tid_lock);
   list_init(&fifo_ready_list);
+  list_init(&prio_ready_list);
+  list_init(&sleep_list);
   list_init(&all_list);
 
   /* Set up a thread structure for the running thread. */
@@ -208,7 +213,9 @@ tid_t thread_create(const char* name, int priority, thread_func* function, void*
 
   /* Add to run queue. */
   thread_unblock(t);
-
+  if (thread_current()->priority < priority) {
+      thread_yield();
+  }
   return tid;
 }
 
@@ -234,10 +241,18 @@ static void thread_enqueue(struct thread* t) {
   ASSERT(intr_get_level() == INTR_OFF);
   ASSERT(is_thread(t));
 
-  if (active_sched_policy == SCHED_FIFO)
+  switch (active_sched_policy)
+  {
+  case SCHED_FIFO:
     list_push_back(&fifo_ready_list, &t->elem);
-  else
+    break;
+  case SCHED_PRIO:
+    list_insert_ordered (&prio_ready_list, &t->elem, thread_cmp_priority_elem, NULL);
+    break;
+  
+  default:
     PANIC("Unimplemented scheduling policy value: %d", active_sched_policy);
+  }
 }
 
 /* Transitions a blocked thread T to the ready-to-run state.
@@ -260,6 +275,48 @@ void thread_unblock(struct thread* t) {
   intr_set_level(old_level);
 }
 
+void thread_sleep(int64_t wakeup_tick) {
+  // 核心！关闭中断，防止并发导致的链表错乱
+  enum intr_level old_level = intr_disable(); 
+  
+  struct thread* t = thread_current();
+  t->wakeup_tick = wakeup_tick;
+  
+  if (wakeup_tick < min_wakeup_tick) {
+    min_wakeup_tick = wakeup_tick;
+  }
+  
+  list_insert_ordered(&sleep_list, &t->elem, thread_cmp_priority_elem, NULL); // 按优先级插入睡眠链表
+  thread_block(); // 安心睡觉
+  
+  // 醒来后，恢复之前的中断状态
+  intr_set_level(old_level); 
+}
+
+// 【重构你的 thread_unblock_all】：提供给 timer_interrupt 调用的接口
+void thread_check_sleep(int64_t current_tick) {
+  // O(1) 检查：如果连最早该醒的都没到时间，直接返回，不遍历链表
+  if (current_tick < min_wakeup_tick||list_empty(&sleep_list)) {
+    return;
+  }
+  
+  struct list_elem* e = list_begin(&sleep_list);
+  int64_t new_min_wakeup_tick = INT64_MAX;
+  
+  while (e != list_end(&sleep_list)) {
+    struct thread* t = list_entry(e, struct thread, elem);
+    if (t->wakeup_tick <= current_tick) {
+      e = list_remove(e);
+      thread_unblock(t); // 唤醒线程
+    } else {
+      if (t->wakeup_tick < new_min_wakeup_tick) {
+        new_min_wakeup_tick = t->wakeup_tick;
+      }
+      e = list_next(e);
+    }
+  }
+  min_wakeup_tick = new_min_wakeup_tick;
+}
 /* Returns the name of the running thread. */
 const char* thread_name(void) { return thread_current()->name; }
 
@@ -328,7 +385,31 @@ void thread_foreach(thread_action_func* func, void* aux) {
 }
 
 /* Sets the current thread's priority to NEW_PRIORITY. */
-void thread_set_priority(int new_priority) { thread_current()->priority = new_priority; }
+void thread_set_priority (int new_priority) 
+{
+  struct thread *curr = thread_current ();
+  curr->base_priority = new_priority;
+  
+  // 无论什么策略，更新有效优先级都是安全的
+  update_priority(); 
+  
+  // 只在优先级调度模式下执行抢占
+  if (active_sched_policy == SCHED_PRIO) {
+      // 这里的逻辑建议直接封装，因为你在 lock_release 等地方也需要这一段
+      thread_test_preemption(); 
+  }
+}
+void thread_test_preemption (void) {
+    if (intr_context()) return; // 中断处理中不抢占
+    
+    struct list *ready_list = &prio_ready_list;
+    if (!list_empty(ready_list)) {
+        struct thread *highest_ready = list_entry(list_begin(ready_list), struct thread, elem);
+        if (thread_current()->priority < highest_ready->priority) {
+            thread_yield();
+        }
+    }
+}
 
 /* Returns the current thread's priority. */
 int thread_get_priority(void) { return thread_current()->priority; }
@@ -428,8 +509,10 @@ static void init_thread(struct thread* t, const char* name, int priority) {
   strlcpy(t->name, name, sizeof t->name);
   t->stack = (uint8_t*)t + PGSIZE;
   t->priority = priority;
-  t->pcb = NULL;
   t->magic = THREAD_MAGIC;
+  t->base_priority = priority; 
+  t->wait_lock = NULL; // 初始化 wait_lock 为 NULL
+  list_init(&t->donations); // 初始化捐赠列表
 #ifdef USERPROG
     list_init(&t->children);  // 初始化子进程链表
     t->pcb = NULL;            // 初始化 PCB 指针
@@ -461,7 +544,10 @@ static struct thread* thread_schedule_fifo(void) {
 
 /* Strict priority scheduler */
 static struct thread* thread_schedule_prio(void) {
-  PANIC("Unimplemented scheduler policy: \"-sched=prio\"");
+  if(!list_empty(&prio_ready_list))
+    return list_entry(list_pop_front(&prio_ready_list), struct thread, elem);
+  else
+    return idle_thread;
 }
 
 /* Fair priority scheduler */
@@ -577,4 +663,28 @@ int add_fd_to_table(struct thread* t, struct file* f) {
         }
     }
     return -1; // 文件描述符表已满
+}
+
+bool thread_cmp_priority_elem (const struct list_elem *a,
+                          const struct list_elem *b,
+                          void *aux UNUSED) 
+{
+  struct thread *ta = list_entry (a, struct thread, elem);
+  struct thread *tb = list_entry (b, struct thread, elem);
+  
+  
+  return ta->priority > tb->priority;
+}
+
+bool thread_cmp_priority_allelem (const struct list_elem *a,
+                          const struct list_elem *b,
+                          void *aux UNUSED) 
+{
+  struct thread *ta = list_entry (a, struct thread, allelem);
+  struct thread *tb = list_entry (b, struct thread, allelem);
+  
+  // 注意：这里用大于号 (>)。
+  // list_insert_ordered 默认是升序。我们想要降序（优先级最高的在队首），
+  // 所以当 a 的优先级大于 b 时，告诉系统 a 应该排在 b 前面。
+  return ta->priority > tb->priority;
 }
