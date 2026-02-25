@@ -32,7 +32,7 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 
-#define MAX_DONATION_DEPTH 8
+
 /* Initializes semaphore SEMA to VALUE.  A semaphore is a
    nonnegative integer along with two atomic operators for
    manipulating it:
@@ -188,27 +188,6 @@ void lock_acquire(struct lock* lock) {
   curr->wait_lock = NULL;   // 我不再等这个锁了
   lock->holder = curr;         // 这个锁的主人是我了
 }
-
-void donate_priority(struct thread *t) {
-    int depth = 0;
-    // 顺藤摸瓜：只要我还等着锁，且没超过 8 层
-    while (t->wait_lock != NULL && depth < MAX_DONATION_DEPTH) {
-        struct thread *holder = t->wait_lock->holder;
-        if (holder == NULL) break;
-        
-        // 如果我的优先级比持锁人大，就把我的优先级给他
-        if (holder->priority < t->priority) {
-            holder->priority = t->priority;
-        } else {
-            // 如果持锁人比我还高，说明不用往上传递了，直接退出
-            break; 
-        }
-        
-        // 继续顺藤摸瓜
-        t = holder;
-        depth++;
-    }
-}
 /* Tries to acquires LOCK and returns true if successful or false
    on failure.  The lock must not already be held by the current
    thread.
@@ -238,8 +217,8 @@ void lock_release(struct lock* lock) {
   remove_with_lock(lock); // 先把和这个锁相关的捐赠都撤销了
   update_priority(); // 更新一下优先级
   lock->holder = NULL;
-
   sema_up(&lock->semaphore);
+  thread_test_preemption(); // 释放锁后可能有更高优先级的线程等着了，测试一下要不要抢占
 }
 
 void remove_with_lock(struct lock *lock) {
@@ -260,24 +239,6 @@ void remove_with_lock(struct lock *lock) {
     }
 }
 
-void update_priority(void) {
-    struct thread *curr = thread_current();
-    
-    // 1. 先把自己打回原形（恢复到基础优先级）
-    curr->priority = curr->base_priority;
-    
-    // 2. 如果还有其他人在给我捐赠（因为我还持有其他的锁）
-    if (!list_empty(&curr->donations)) {
-        // 由于捐赠者的优先级可能会动态变化，最稳妥的做法是遍历一遍找最大值
-        struct list_elem *e;
-        for (e = list_begin(&curr->donations); e != list_end(&curr->donations); e = list_next(e)) {
-            struct thread *t = list_entry(e, struct thread, donation_elem);
-            if (t->priority > curr->priority) {
-                curr->priority = t->priority; // 更新为更高的优先级
-            }
-        }
-    }
-}
 /* Returns true if the current thread holds LOCK, false
    otherwise.  (Note that testing whether some other thread holds
    a lock would be racy.) */

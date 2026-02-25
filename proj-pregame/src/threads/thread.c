@@ -13,12 +13,14 @@
 #include "threads/vaddr.h"
 #ifdef USERPROG
 #include "userprog/process.h"
+#include "lib/kernel/hash.h"
 #endif
 
 /* Random value for struct thread's `magic' member.
    Used to detect stack overflow.  See the big comment at the top
    of thread.h for details. */
 #define THREAD_MAGIC 0xcd6abf4b
+#define MAX_DONATION_DEPTH 8
 
 /* List of processes in THREAD_READY state, that is, processes
    that are ready to run but not actually running. */
@@ -195,7 +197,7 @@ tid_t thread_create(const char* name, int priority, thread_func* function, void*
   /* Initialize thread. */
   init_thread(t, name, priority);
   tid = t->tid = allocate_tid();
-
+  t->parent = thread_current();
   /* Stack frame for kernel_thread(). */
   kf = alloc_frame(t, sizeof *kf);
   kf->eip = NULL;
@@ -387,7 +389,7 @@ void thread_foreach(thread_action_func* func, void* aux) {
 /* Sets the current thread's priority to NEW_PRIORITY. */
 void thread_set_priority (int new_priority) 
 {
-  struct thread *curr = thread_current ();
+  struct thread *curr = thread_current();
   curr->base_priority = new_priority;
   
   // 无论什么策略，更新有效优先级都是安全的
@@ -399,6 +401,7 @@ void thread_set_priority (int new_priority)
       thread_test_preemption(); 
   }
 }
+// 在优先级调度模式下，测试当前线程是否需要抢占
 void thread_test_preemption (void) {
     if (intr_context()) return; // 中断处理中不抢占
     
@@ -513,10 +516,16 @@ static void init_thread(struct thread* t, const char* name, int priority) {
   t->base_priority = priority; 
   t->wait_lock = NULL; // 初始化 wait_lock 为 NULL
   list_init(&t->donations); // 初始化捐赠列表
+  list_init(&t->children);  // 初始化子进程链表
+  t->info = NULL;           // 初始化 info 指针
 #ifdef USERPROG
-    list_init(&t->children);  // 初始化子进程链表
     t->pcb = NULL;            // 初始化 PCB 指针
-    t->info = NULL;           // 初始化 info 指针
+    lock_init(&t->pcb->fd_lock);  // 初始化文件描述符表相关的锁
+    lock_init(&t->pcb->sync_map_lock); // 初始化同步映射表相关的锁
+    lock_init(&t->user_tid_lock); // 初始化用户线程 ID 锁
+    memset(t->pcb->fd_table, 0, sizeof(t->pcb->fd_table)); // 初始化文件描述符表
+    t->user_tid=0; // 初始化用户线程 ID
+    t->user_stack = PHYS_BASE; // 初始化用户栈指针
 #endif
   old_level = intr_disable();
   list_push_back(&all_list, &t->allelem);
@@ -656,13 +665,56 @@ static tid_t allocate_tid(void) {
 uint32_t thread_stack_ofs = offsetof(struct thread, stack);
 
 int add_fd_to_table(struct thread* t, struct file* f) {
+  #ifdef USERPROG
     for (int fd = 3; fd < 128; fd++) { // 从 2 开始，0 和 1 通常保留给标准输入输出
-        if (t->fd_table[fd] == NULL) {
-            t->fd_table[fd] = f;
+        if (t->pcb->fd_table[fd] == NULL) {
+            t->pcb->fd_table[fd] = f;
             return fd;
         }
     }
     return -1; // 文件描述符表已满
+  #else
+    return -1; // 内核线程不支持文件描述符
+  #endif
+}
+
+// 假设这是在 thread.c 中（或者你能访问到 ready_list 的地方）
+ void donate_priority(struct thread *t) {
+    int depth = 0;
+    // 顺藤摸瓜：只要我还等着锁，且没超过 8 层
+    while (t->wait_lock != NULL && depth < MAX_DONATION_DEPTH) {
+        struct thread *holder = t->wait_lock->holder;
+        if (holder == NULL) break;
+        // 如果我的优先级比持锁人大，就把我的优先级给
+        if (holder->priority < t->priority) {
+            holder->priority = t->priority;
+        } else {
+            // 如果持锁人比我还高，说明不用往上传递了，直接退出
+            break;
+        }
+        // 继续顺藤摸瓜
+        t = holder;
+        depth++;
+    }
+} 
+
+void update_priority(void) {
+    struct thread *curr = thread_current();
+    
+    // 1. 先把自己打回原形（恢复到基础优先级）
+    curr->priority = curr->base_priority;
+    
+    // 2. 如果还有其他人在给我捐赠（因为我还持有其他的锁）
+    if (!list_empty(&curr->donations)) {
+        // 由于捐赠者的优先级可能会动态变化，最稳妥的做法是遍历一遍找最大值
+        struct list_elem *e;
+        for (e = list_begin(&curr->donations); e != list_end(&curr->donations); e = list_next(e)) {
+            struct thread *t = list_entry(e, struct thread, donation_elem);
+            if (t->priority > curr->priority) {
+                curr->priority = t->priority; // 更新为更高的优先级
+            }
+        }
+    }
 }
 
 bool thread_cmp_priority_elem (const struct list_elem *a,
@@ -676,15 +728,6 @@ bool thread_cmp_priority_elem (const struct list_elem *a,
   return ta->priority > tb->priority;
 }
 
-bool thread_cmp_priority_allelem (const struct list_elem *a,
-                          const struct list_elem *b,
-                          void *aux UNUSED) 
-{
-  struct thread *ta = list_entry (a, struct thread, allelem);
-  struct thread *tb = list_entry (b, struct thread, allelem);
-  
-  // 注意：这里用大于号 (>)。
-  // list_insert_ordered 默认是升序。我们想要降序（优先级最高的在队首），
-  // 所以当 a 的优先级大于 b 时，告诉系统 a 应该排在 b 前面。
-  return ta->priority > tb->priority;
-}
+
+//user_multi_thread
+

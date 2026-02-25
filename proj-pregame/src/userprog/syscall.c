@@ -13,6 +13,7 @@ struct lock filesys_lock;
 static void syscall_handler(struct intr_frame*);
 struct lock filesys_lock;
 void syscall_init(void) { intr_register_int(0x30, 3, INTR_ON, syscall_handler, "syscall"); lock_init(&filesys_lock); }
+
 /* 检查单个地址是否合法：
    1. 不为 NULL
    2. 是用户空间地址
@@ -191,13 +192,13 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
           get_args(f, argv, 1);
           int fd = (int)argv[0];
           struct thread* curr = thread_current();
-          if (fd < 0 || fd >= 128 || curr->fd_table[fd] == NULL) {
+          if (fd < 0 || fd >= 128 || curr->pcb->fd_table[fd] == NULL) {
               f->eax = -1; // 无效的文件描述符
               break;
           }
 
           lock_acquire(&filesys_lock);
-          int size = file_length(curr->fd_table[fd]);
+          int size = file_length(curr->pcb->fd_table[fd]);
           lock_release(&filesys_lock);
 
           f->eax = (int)size;
@@ -231,14 +232,14 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
           else {
               /* 普通文件处理 */
               struct thread* curr = thread_current();
-              if (fd < 0 || fd >= 128 || curr->fd_table[fd] == NULL) {
+              if (fd < 0 || fd >= 128 || curr->pcb->fd_table[fd] == NULL) {
                   f->eax = -1;
                   break;
               }
 
               lock_acquire(&filesys_lock);
               // file_read 内部会更新文件的 offset，所以不需要你手动去移动位置
-              f->eax = file_read(curr->fd_table[fd], buffer, size);
+              f->eax = file_read(curr->pcb->fd_table[fd], buffer, size);
               lock_release(&filesys_lock);
           }
           break;
@@ -267,14 +268,14 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
           else {
               /* 普通文件处理 */
               struct thread* curr = thread_current();
-              if (fd < 0 || fd >= 128 || curr->fd_table[fd] == NULL) {
+              if (fd < 0 || fd >= 128 || curr->pcb->fd_table[fd] == NULL) {
                   f->eax = -1;
                   break;
               }
 
               lock_acquire(&filesys_lock);
               // file_write 内部会更新文件的 offset，所以不需要你手动去移动位置
-              f->eax = file_write(curr->fd_table[fd], buffer, size);
+              f->eax = file_write(curr->pcb->fd_table[fd], buffer, size);
               lock_release(&filesys_lock);
           }
           break;
@@ -286,12 +287,12 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
           unsigned position = (unsigned)argv[1];
 
           struct thread* curr = thread_current();
-          if (fd < 0 || fd >= 128 || curr->fd_table[fd] == NULL) {
+          if (fd < 0 || fd >= 128 || curr->pcb->fd_table[fd] == NULL) {
               break; // 无效的文件描述符，直接返回
           }
 
           lock_acquire(&filesys_lock);
-          file_seek(curr->fd_table[fd], position);
+          file_seek(curr->pcb->fd_table[fd], position);
           lock_release(&filesys_lock);
 
           break;
@@ -302,13 +303,13 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
           int fd = (int)argv[0];
 
           struct thread* curr = thread_current();
-          if (fd < 0 || fd >= 128 || curr->fd_table[fd] == NULL) {
+          if (fd < 0 || fd >= 128 || curr->pcb->fd_table[fd] == NULL) {
               f->eax = -1; // 无效的文件描述符
               break;
           }
 
           lock_acquire(&filesys_lock);
-          unsigned position = file_tell(curr->fd_table[fd]);
+          unsigned position = file_tell(curr->pcb->fd_table[fd]);
           lock_release(&filesys_lock);
 
           f->eax = position;
@@ -320,13 +321,13 @@ static void syscall_handler(struct intr_frame* f UNUSED) {
           int fd = (int)argv[0];
 
           struct thread* curr = thread_current();
-          if (fd < 0 || fd >= 128 || curr->fd_table[fd] == NULL) {
+          if (fd < 0 || fd >= 128 || curr->pcb->fd_table[fd] == NULL) {
               break; // 无效的文件描述符，直接返回
           }
 
           lock_acquire(&filesys_lock);
-          file_close(curr->fd_table[fd]);
-          curr->fd_table[fd] = NULL; // 从文件描述符表中移除
+          file_close(curr->pcb->fd_table[fd]);
+          curr->pcb->fd_table[fd] = NULL; // 从文件描述符表中移除
           lock_release(&filesys_lock);
 
           break;

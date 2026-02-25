@@ -164,15 +164,16 @@ pid_t process_execute(const char* file_name) {
   return tid;
 }
 
-pid_t process_fork(const char* name, struct intr_frame* iframe) {
-  struct child_info* info = malloc(sizeof(struct child_info));
-  if (info == NULL)
-    return TID_ERROR;
+void init_child_info(struct child_info* info){
   info->tid = TID_ERROR;
   info->is_exit = false;
   info->is_waited = false;
   info->exit_status = 0;
   sema_init(&info->wait_sema, 0);
+}
+pid_t process_fork(const char* name, struct intr_frame* iframe) {
+  struct child_info* info = malloc(sizeof(struct child_info));
+  init_child_info(info);
   char thread_name[16];
   strlcpy(thread_name, name, sizeof thread_name);
   char *cp = thread_name;
@@ -357,17 +358,6 @@ static void start_process(void* args_) {
     t->info->is_exit = true;
     thread_exit();
   }
-
-  /* Start the user process by simulating a return from an
-     interrupt, implemented by intr_exit (in
-     threads/intr-stubs.S).  Because intr_exit takes all of its
-     arguments on the stack in the form of a `struct intr_frame',
-     we just point the stack pointer (%esp) to our stack frame
-     and jump to it. */
-  /*启动用户进程通过模拟从中断返回来实现，由 intr_exit 实现（在 threads/intr-stubs.S 中）。
-    因为 intr_exit 以 struct intr_frame 的形式在堆栈上获取它的所有参数，
-    我们只需将堆栈指针（%esp）指向我们的堆栈帧并跳转到它。*/
-  //printf("(%s) begin\n", file_name);
   asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&if_) : "memory");
   NOT_REACHED();
 }
@@ -898,3 +888,4 @@ void pthread_exit(void) {}
    This function will be implemented in Project 2: Multithreading. For
    now, it does nothing. */
 void pthread_exit_main(void) {}
+
